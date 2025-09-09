@@ -23,17 +23,31 @@ interface StreamData {
   wowzaStatus: 'online' | 'offline' | 'error';
   applicationName: string;
   streamName: string;
+  currentPlaylist?: {
+    id: number;
+    name: string;
+    videos: any[];
+    currentVideoIndex: number;
+    isPlaying: boolean;
+    loop: boolean;
+    shuffle: boolean;
+  };
+  streamType: 'obs' | 'playlist' | 'none';
 }
 
 interface StreamContextType {
   streamData: StreamData;
   updateStreamData: (data: Partial<StreamData>) => void;
-  startStream: (platforms: string[]) => Promise<void>;
+  startPlaylistStream: (playlistId: number, options?: { loop?: boolean; shuffle?: boolean }) => Promise<void>;
   stopStream: () => Promise<void>;
   refreshStreamStatus: () => Promise<void>;
   updatePlatformConfig: (platformId: string, config: Partial<StreamPlatform>) => void;
   connectToPlatform: (platformId: string) => Promise<void>;
   disconnectFromPlatform: (platformId: string) => Promise<void>;
+  nextVideo: () => void;
+  previousVideo: () => void;
+  playVideo: (index: number) => void;
+  togglePlayPause: () => void;
 }
 
 const StreamContext = createContext<StreamContextType | null>(null);
@@ -76,7 +90,8 @@ export const StreamProvider: React.FC<StreamProviderProps> = ({ children }) => {
     platforms: defaultPlatforms,
     wowzaStatus: 'offline',
     applicationName: 'live',
-    streamName: ''
+    streamName: '',
+    streamType: 'none'
   });
 
   const updateStreamData = (data: Partial<StreamData>) => {
@@ -118,18 +133,58 @@ export const StreamProvider: React.FC<StreamProviderProps> = ({ children }) => {
     }
   };
 
-  const startStream = async (selectedPlatforms: string[]) => {
+  const startPlaylistStream = async (playlistId: number, options: { loop?: boolean; shuffle?: boolean } = {}) => {
     try {
       const token = await getToken();
-      const response = await fetch('/api/streaming/start', {
+      
+      // Carregar dados da playlist
+      const playlistResponse = await fetch(`/api/playlists/${playlistId}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      if (!playlistResponse.ok) {
+        throw new Error('Playlist não encontrada');
+      }
+      
+      const playlist = await playlistResponse.json();
+      
+      // Carregar vídeos da playlist
+      const videosResponse = await fetch(`/api/playlists/${playlistId}/videos`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      if (!videosResponse.ok) {
+        throw new Error('Erro ao carregar vídeos da playlist');
+      }
+      
+      const playlistVideos = await videosResponse.json();
+      const videos = playlistVideos.map((item: any) => item.videos);
+      
+      if (videos.length === 0) {
+        throw new Error('Playlist não possui vídeos');
+      }
+      
+      // Embaralhar vídeos se solicitado
+      let finalVideos = [...videos];
+      if (options.shuffle) {
+        finalVideos = finalVideos.sort(() => Math.random() - 0.5);
+      }
+      
+      // Iniciar stream interno
+      const response = await fetch('/api/streaming/start-internal', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
         body: JSON.stringify({
-          titulo: 'Transmissão ao vivo',
-          platform_ids: selectedPlatforms
+          playlist_id: playlistId,
+          titulo: playlist.nome,
+          videos: finalVideos,
+          options: {
+            loop: options.loop ?? true,
+            shuffle: options.shuffle ?? false
+          }
         })
       });
 
@@ -138,28 +193,29 @@ export const StreamProvider: React.FC<StreamProviderProps> = ({ children }) => {
       if (result.success) {
         updateStreamData({
           isLive: true,
-          streamUrl: result.wowza_data?.rtmpUrl || '',
-          streamName: result.wowza_data?.streamName || '',
-          title: result.transmission.titulo,
+          streamUrl: result.stream_url || '',
+          streamName: result.stream_name || '',
+          title: playlist.nome,
           startTime: new Date(),
           viewers: 0,
-          bitrate: result.wowza_data?.bitrate || 2500,
-          wowzaStatus: 'online'
-        });
-
-        // Conectar às plataformas selecionadas
-        for (const platformId of selectedPlatforms) {
-          try {
-            await connectToPlatform(platformId);
-          } catch (error) {
-            console.error(`Erro ao conectar à plataforma ${platformId}:`, error);
+          bitrate: 2500,
+          wowzaStatus: 'online',
+          streamType: 'playlist',
+          currentPlaylist: {
+            id: playlistId,
+            name: playlist.nome,
+            videos: finalVideos,
+            currentVideoIndex: 0,
+            isPlaying: true,
+            loop: options.loop ?? true,
+            shuffle: options.shuffle ?? false
           }
-        }
+        });
       } else {
-        throw new Error(result.error || 'Erro ao iniciar transmissão');
+        throw new Error(result.error || 'Erro ao iniciar playlist');
       }
     } catch (error) {
-      console.error('Erro ao iniciar stream:', error);
+      console.error('Erro ao iniciar playlist:', error);
       throw error;
     }
   };
@@ -167,28 +223,20 @@ export const StreamProvider: React.FC<StreamProviderProps> = ({ children }) => {
   const stopStream = async () => {
     try {
       const token = await getToken();
-      const response = await fetch('/api/streaming/stop', {
+      const response = await fetch('/api/streaming/stop-internal', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
-        }
+        },
+        body: JSON.stringify({
+          stream_type: streamData.streamType
+        })
       });
 
       const result = await response.json();
 
       if (result.success) {
-        // Desconectar de todas as plataformas
-        const connectedPlatforms = streamData.platforms.filter(p => p.status === 'connected');
-        
-        for (const platform of connectedPlatforms) {
-          try {
-            await disconnectFromPlatform(platform.id);
-          } catch (error) {
-            console.error(`Erro ao desconectar da plataforma ${platform.id}:`, error);
-          }
-        }
-
         updateStreamData({
           isLive: false,
           streamUrl: '',
@@ -198,7 +246,9 @@ export const StreamProvider: React.FC<StreamProviderProps> = ({ children }) => {
           duration: 0,
           startTime: undefined,
           wowzaStatus: 'offline',
-          streamName: ''
+          streamName: '',
+          streamType: 'none',
+          currentPlaylist: undefined
         });
       } else {
         throw new Error(result.error || 'Erro ao parar transmissão');
@@ -242,6 +292,73 @@ export const StreamProvider: React.FC<StreamProviderProps> = ({ children }) => {
     }
   };
 
+  const nextVideo = () => {
+    if (!streamData.currentPlaylist) return;
+    
+    const { videos, currentVideoIndex, loop } = streamData.currentPlaylist;
+    let nextIndex = currentVideoIndex + 1;
+    
+    if (nextIndex >= videos.length) {
+      if (loop) {
+        nextIndex = 0;
+      } else {
+        // Parar playlist se não está em loop
+        stopStream();
+        return;
+      }
+    }
+    
+    updateStreamData({
+      currentPlaylist: {
+        ...streamData.currentPlaylist,
+        currentVideoIndex: nextIndex
+      }
+    });
+  };
+
+  const previousVideo = () => {
+    if (!streamData.currentPlaylist) return;
+    
+    const { videos, currentVideoIndex } = streamData.currentPlaylist;
+    let prevIndex = currentVideoIndex - 1;
+    
+    if (prevIndex < 0) {
+      prevIndex = videos.length - 1;
+    }
+    
+    updateStreamData({
+      currentPlaylist: {
+        ...streamData.currentPlaylist,
+        currentVideoIndex: prevIndex
+      }
+    });
+  };
+
+  const playVideo = (index: number) => {
+    if (!streamData.currentPlaylist) return;
+    
+    const { videos } = streamData.currentPlaylist;
+    if (index >= 0 && index < videos.length) {
+      updateStreamData({
+        currentPlaylist: {
+          ...streamData.currentPlaylist,
+          currentVideoIndex: index
+        }
+      });
+    }
+  };
+
+  const togglePlayPause = () => {
+    if (!streamData.currentPlaylist) return;
+    
+    updateStreamData({
+      currentPlaylist: {
+        ...streamData.currentPlaylist,
+        isPlaying: !streamData.currentPlaylist.isPlaying
+      }
+    });
+  };
+
   // Atualizar uptime e duração quando a transmissão estiver ativa
   useEffect(() => {
     if (!streamData.isLive || !streamData.startTime) return;
@@ -280,12 +397,16 @@ export const StreamProvider: React.FC<StreamProviderProps> = ({ children }) => {
     <StreamContext.Provider value={{
       streamData,
       updateStreamData,
-      startStream,
+      startPlaylistStream,
       stopStream,
       refreshStreamStatus,
       updatePlatformConfig,
       connectToPlatform,
-      disconnectFromPlatform
+      disconnectFromPlatform,
+      nextVideo,
+      previousVideo,
+      playVideo,
+      togglePlayPause
     }}>
       {children}
     </StreamContext.Provider>

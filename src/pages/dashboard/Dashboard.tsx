@@ -3,7 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import { useStream } from '../../context/StreamContext';
 import { 
   Activity, Users, Zap, Clock, Play, Square, Radio, Video, 
-  TrendingUp, Globe, Monitor, Smartphone, Eye, Settings,
+  TrendingUp, Globe, Monitor, Smartphone, Eye, Settings, SkipForward, SkipBack, Pause,
   AlertCircle, CheckCircle, Wifi, WifiOff, Server, HardDrive
 } from 'lucide-react';
 import { toast } from 'react-toastify';
@@ -49,7 +49,7 @@ interface RecentVideo {
 
 const Dashboard: React.FC = () => {
   const { user, getToken } = useAuth();
-  const { streamData } = useStream();
+  const { streamData, nextVideo, previousVideo, togglePlayPause, stopStream } = useStream();
   const [stats, setStats] = useState<DashboardStats>({
     totalVideos: 0,
     totalPlaylists: 0,
@@ -64,6 +64,7 @@ const Dashboard: React.FC = () => {
   const [currentVideoUrl, setCurrentVideoUrl] = useState<string>('');
   const [showPlayer, setShowPlayer] = useState(false);
   const [loadingStats, setLoadingStats] = useState(false);
+  const [currentVideo, setCurrentVideo] = useState<any>(null);
 
   const userLogin = user?.usuario || (user?.email ? user.email.split('@')[0] : `user_${user?.id || 'usuario'}`);
 
@@ -143,16 +144,31 @@ const Dashboard: React.FC = () => {
         const data = await response.json();
         setStreamStatus(data);
         
-        // Definir URL do player baseado no status
+        // Configurar player baseado no status
         if (data.is_live) {
-          if (data.stream_type === 'obs' || data.obs_stream?.is_live) {
-            setCurrentVideoUrl(`${userLogin}/live/${userLogin}_live.mp4`);
+          if (data.stream_type === 'playlist' && data.transmission) {
+            // Playlist interna ativa
+            const settings = data.transmission.settings || {};
+            const videos = settings.videos || [];
+            const currentIndex = settings.currentVideoIndex || 0;
+            
+            if (videos[currentIndex]) {
+              setCurrentVideo(videos[currentIndex]);
+              setCurrentVideoUrl(buildVideoUrl(videos[currentIndex].url));
+            }
+            setShowPlayer(true);
+          } else if (data.stream_type === 'obs' || data.obs_stream?.is_live) {
+            // Stream OBS ativo
+            setCurrentVideoUrl(`/api/players/iframe?stream=${userLogin}_live&aspectratio=16:9&player_type=1`);
+            setShowPlayer(true);
           } else if (data.transmission) {
-            setCurrentVideoUrl(`${userLogin}/playlist/${userLogin}_playlist.mp4`);
+            // Transmissão externa ativa
+            setCurrentVideoUrl(`/api/players/iframe?stream=${userLogin}_playlist&aspectratio=16:9&player_type=1`);
+            setShowPlayer(true);
           }
-          setShowPlayer(true);
         } else {
           setShowPlayer(false);
+          setCurrentVideo(null);
         }
       }
     } catch (error) {
@@ -184,6 +200,36 @@ const Dashboard: React.FC = () => {
       }
     } catch (error) {
       console.error('Erro ao carregar vídeos recentes:', error);
+    }
+  };
+
+  // Função para construir URL do vídeo
+  const buildVideoUrl = (videoPath: string) => {
+    if (!videoPath) return '';
+    
+    const cleanPath = videoPath.replace(/^\/+/, '').replace(/^(content\/|streaming\/)?/, '');
+    const pathParts = cleanPath.split('/');
+    
+    if (pathParts.length >= 3) {
+      const userLogin = pathParts[0];
+      const folderName = pathParts[1];
+      const fileName = pathParts[2];
+      const finalFileName = fileName.endsWith('.mp4') ? fileName : fileName.replace(/\.[^/.]+$/, '.mp4');
+      
+      return `/api/players/iframe?login=${userLogin}&vod=${folderName}/${finalFileName}&aspectratio=16:9&player_type=1&autoplay=true`;
+    }
+    
+    return '';
+  };
+
+  const handleStopStream = async () => {
+    try {
+      await stopStream();
+      toast.success('Transmissão finalizada');
+      setShowPlayer(false);
+      setCurrentVideo(null);
+    } catch (error) {
+      toast.error('Erro ao finalizar transmissão');
     }
   };
 
@@ -427,13 +473,19 @@ const Dashboard: React.FC = () => {
               {showPlayer && currentVideoUrl ? (
                 <VideoJSPlayer
                   src={currentVideoUrl}
-                  title={streamStatus?.transmission?.titulo || 'Transmissão ao Vivo'}
-                  isLive={streamStatus?.is_live || false}
+                  title={currentVideo?.nome || streamStatus?.transmission?.titulo || 'Transmissão ao Vivo'}
+                  isLive={streamStatus?.stream_type === 'obs'}
                   autoplay={false}
                   controls={true}
                   className="w-full h-full"
                   onPlay={() => console.log('Video.js Dashboard iniciado')}
                   onPause={() => console.log('Video.js Dashboard pausado')}
+                  onEnded={() => {
+                    // Auto-avançar para próximo vídeo se for playlist
+                    if (streamStatus?.stream_type === 'playlist' && streamData.currentPlaylist) {
+                      nextVideo();
+                    }
+                  }}
                   onError={(error) => {
                     console.error('Erro no Video.js Dashboard:', error);
                   }}
@@ -460,6 +512,76 @@ const Dashboard: React.FC = () => {
                 </div>
               )}
             </div>
+
+            {/* Controles da Playlist */}
+            {streamStatus?.stream_type === 'playlist' && streamData.currentPlaylist && (
+              <div className="mt-4 bg-gray-800 rounded-lg p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <h4 className="text-white font-medium">{streamData.currentPlaylist.name}</h4>
+                    <p className="text-gray-300 text-sm">
+                      Vídeo {streamData.currentPlaylist.currentVideoIndex + 1} de {streamData.currentPlaylist.videos.length}
+                    </p>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <button
+                      onClick={previousVideo}
+                      disabled={streamData.currentPlaylist.currentVideoIndex === 0}
+                      className="text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-full p-2"
+                    >
+                      <SkipBack className="h-4 w-4" />
+                    </button>
+                    <button
+                      onClick={togglePlayPause}
+                      className="text-white bg-green-600 hover:bg-green-700 rounded-full p-2"
+                    >
+                      {streamData.currentPlaylist.isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                    </button>
+                    <button
+                      onClick={nextVideo}
+                      disabled={streamData.currentPlaylist.currentVideoIndex === streamData.currentPlaylist.videos.length - 1 && !streamData.currentPlaylist.loop}
+                      className="text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-full p-2"
+                    >
+                      <SkipForward className="h-4 w-4" />
+                    </button>
+                    <button
+                      onClick={handleStopStream}
+                      className="text-white bg-red-600 hover:bg-red-700 rounded-full p-2"
+                    >
+                      <Square className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+                
+                {/* Lista de vídeos da playlist */}
+                <div className="max-h-32 overflow-y-auto">
+                  <div className="space-y-1">
+                    {streamData.currentPlaylist.videos.map((video, index) => (
+                      <button
+                        key={video.id}
+                        onClick={() => {
+                          const videoUrl = buildVideoUrl(video.url);
+                          setCurrentVideoUrl(videoUrl);
+                          setCurrentVideo(video);
+                        }}
+                        className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${
+                          index === streamData.currentPlaylist.currentVideoIndex 
+                            ? 'bg-blue-600 text-white' 
+                            : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="truncate">{index + 1}. {video.nome}</span>
+                          {index === streamData.currentPlaylist.currentVideoIndex && (
+                            <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse ml-2"></div>
+                          )}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
