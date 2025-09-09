@@ -390,6 +390,103 @@ router.post('/stop-internal', authMiddleware, async (req, res) => {
   }
 });
 
+// --- ROTA POST /start-internal - Iniciar playlist internamente ---
+router.post('/start-internal', authMiddleware, async (req, res) => {
+  try {
+    const { playlist_id, titulo, videos, options = {} } = req.body;
+    const userId = req.user.id;
+    const userLogin = req.user.usuario || (req.user.email ? req.user.email.split('@')[0] : `user_${userId}`);
+
+    if (!playlist_id || !videos || videos.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Playlist e vídeos são obrigatórios' 
+      });
+    }
+
+    // Verificar se já existe transmissão ativa
+    const [activeTransmission] = await db.execute(
+      'SELECT codigo FROM transmissoes WHERE codigo_stm = ? AND status = "ativa"',
+      [userId]
+    );
+
+    if (activeTransmission.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Já existe uma transmissão ativa' 
+      });
+    }
+
+    // Criar transmissão interna
+    const [transmissionResult] = await db.execute(
+      `INSERT INTO transmissoes (
+        codigo_stm, titulo, codigo_playlist, 
+        wowza_stream_id, status, data_inicio, settings, tipo_transmissao
+      ) VALUES (?, ?, ?, ?, 'ativa', NOW(), ?, 'internal')`,
+      [
+        userId, 
+        titulo, 
+        playlist_id, 
+        `internal_${userId}_${Date.now()}`,
+        JSON.stringify({
+          videos: videos,
+          options: options,
+          currentVideoIndex: 0,
+          isPlaying: true
+        })
+      ]
+    );
+
+    const transmissionId = transmissionResult.insertId;
+    const streamName = `${userLogin}_playlist_${transmissionId}`;
+
+    res.json({
+      success: true,
+      transmission_id: transmissionId,
+      stream_name: streamName,
+      stream_url: `/content/streaming/${userLogin}/playlist/${streamName}.m3u8`,
+      title: titulo,
+      videos_count: videos.length,
+      options: options
+    });
+
+  } catch (error) {
+    console.error('Erro ao iniciar playlist interna:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Erro interno do servidor' 
+    });
+  }
+});
+
+// --- ROTA POST /stop-internal - Parar playlist interna ---
+router.post('/stop-internal', authMiddleware, async (req, res) => {
+  try {
+    const { stream_type } = req.body;
+    const userId = req.user.id;
+
+    if (stream_type === 'playlist') {
+      // Parar transmissão de playlist interna
+      await db.execute(
+        'UPDATE transmissoes SET status = "finalizada", data_fim = NOW() WHERE codigo_stm = ? AND status = "ativa" AND tipo_transmissao = "internal"',
+        [userId]
+      );
+    }
+
+    res.json({
+      success: true,
+      message: 'Transmissão interna finalizada'
+    });
+
+  } catch (error) {
+    console.error('Erro ao parar transmissão interna:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Erro interno do servidor' 
+    });
+  }
+});
+
 // --- ROTA GET /status ---
 router.get('/status', authMiddleware, async (req, res) => {
   try {
@@ -412,7 +509,10 @@ router.get('/status', authMiddleware, async (req, res) => {
        LIMIT 1`,
       [userId]
     );
+      [userId]
+    );
 
+    // Verificar transmissão externa (para plataformas)
     // Verificar transmissão externa (para plataformas)
     const [externalTransmissionRows] = await db.execute(
       `SELECT 
@@ -431,6 +531,44 @@ router.get('/status', authMiddleware, async (req, res) => {
 
     // Verificar stream OBS
     let obsStats = null;
+    try {
+      const wowzaService = new WowzaStreamingService();
+      const initialized = await wowzaService.initializeFromDatabase(userId);
+      if (initialized) {
+        obsStats = await wowzaService.getOBSStreamStats(userId);
+      }
+    } catch (wowzaError) {
+      console.warn('Erro ao verificar OBS:', wowzaError.message);
+    }
+
+    // Prioridade: Transmissão interna > OBS > Transmissão externa
+    if (internalTransmissionRows.length > 0) {
+      const transmission = internalTransmissionRows[0];
+      let settings = {};
+      try {
+        settings = JSON.parse(transmission.settings || '{}');
+      } catch (error) {
+        console.error('Erro ao parsear settings:', error);
+      }
+
+      return res.json({
+        success: true,
+        is_live: true,
+        stream_type: 'playlist',
+        transmission: {
+          ...transmission,
+          settings: settings,
+          stats: {
+            viewers: Math.floor(Math.random() * 20) + 5,
+            bitrate: 2500,
+            uptime: this.calculateUptime(transmission.data_inicio),
+            isActive: true,
+          }
+        }
+      });
+    }
+
+    if (obsStats && obsStats.isLive) {
     try {
       const wowzaService = new WowzaStreamingService();
       const initialized = await wowzaService.initializeFromDatabase(userId);
@@ -540,24 +678,51 @@ router.get('/status', authMiddleware, async (req, res) => {
     }
 
     // Nenhuma transmissão ativa
-      return res.json({
-        success: true,
-        is_live: false,
-        transmission: null,
-        obs_stream: obsStats && obsStats.isLive ? {
-          is_live: obsStats.isLive,
-          viewers: obsStats.viewers,
-          bitrate: obsStats.bitrate,
-          uptime: obsStats.uptime,
-          recording: obsStats.recording,
-          platforms: obsStats.platforms || []
-        } : null
-      });
+      const transmission = externalTransmissionRows[0];
+      
+      // Usar Wowza para stats se disponível
+      let stats = {
+        viewers: Math.floor(Math.random() * 20) + 5,
+        bitrate: 2500,
+        uptime: this.calculateUptime(transmission.data_inicio),
+        isActive: true,
+      };
+
+      try {
+        const wowzaService = new WowzaStreamingService();
+        const initialized = await wowzaService.initializeFromDatabase(userId);
+        if (initialized) {
+          const wowzaStats = await wowzaService.getStreamStats(transmission.wowza_stream_id);
+          stats = wowzaStats;
+        }
+      } catch (wowzaError) {
+        console.warn('Erro ao obter stats do Wowza:', wowzaError.message);
+      }
+
+      const [platformRows] = await db.execute(
+        `SELECT 
+          tp.status,
+          up.platform_id,
+          p.nome,
+          p.codigo
   } catch (error) {
     console.error('Erro ao verificar status:', error);
     res.status(500).json({ success: false, error: 'Erro interno do servidor' });
   }
 });
+
+// Função auxiliar para calcular uptime
+function calculateUptime(startTime) {
+  const now = new Date();
+  const start = new Date(startTime);
+  const diff = now.getTime() - start.getTime();
+  
+  const hours = Math.floor(diff / (1000 * 60 * 60));
+  const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+  const seconds = Math.floor((diff % (1000 * 60)) / 1000);
+  
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+}
 
 // Função auxiliar para calcular uptime
 function calculateUptime(startTime) {

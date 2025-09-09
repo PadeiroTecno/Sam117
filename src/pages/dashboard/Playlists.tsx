@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { ChevronDown, ChevronRight, PlusCircle, X, Edit2, Trash2, Play, Minimize, Maximize, Pause, SkipForward, SkipBack, Calendar, Zap, AlertTriangle, CheckCircle } from 'lucide-react';
 import { toast } from 'react-toastify';
 import { useAuth } from '../../context/AuthContext';
+import { useStream } from '../../context/StreamContext';
 import { Link } from 'react-router-dom';
 import IFrameVideoPlayer from '../../components/IFrameVideoPlayer';
 
@@ -60,6 +61,7 @@ interface PlaylistAction {
 
 const Playlists: React.FC = () => {
   const { getToken, user } = useAuth();
+  const { startPlaylistStream, stopStream, streamData } = useStream();
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [status, setStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -732,9 +734,9 @@ const Playlists: React.FC = () => {
     }
   };
 
-  const openActionModal = (playlist: Playlist, actionType: 'start' | 'pause' | 'stop' | 'schedule') => {
+  const openActionModal = (playlist: Playlist, actionType: 'start' | 'pause' | 'stop' | 'schedule' | 'start_internal') => {
     setSelectedAction({
-      type: actionType,
+      type: actionType as any,
       playlistId: playlist.id,
       playlistName: playlist.nome
     });
@@ -745,30 +747,14 @@ const Playlists: React.FC = () => {
     if (!selectedAction) return;
 
     try {
-      const token = await getToken();
-      
       switch (selectedAction.type) {
-        case 'start':
-          // Iniciar transmissão da playlist
-          const startResponse = await fetch('/api/streaming/start', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`
-            },
-            body: JSON.stringify({
-              titulo: `Transmissão: ${selectedAction.playlistName}`,
-              playlist_id: selectedAction.playlistId,
-              platform_ids: [] // Sem plataformas por padrão
-            })
+        case 'start_internal':
+          // Iniciar playlist internamente no painel
+          await startPlaylistStream(selectedAction.playlistId, {
+            loop: true,
+            shuffle: false
           });
-
-          if (startResponse.ok) {
-            toast.success('Transmissão da playlist iniciada!');
-          } else {
-            const errorData = await startResponse.json();
-            toast.error(errorData.error || 'Erro ao iniciar transmissão');
-          }
+          toast.success('Playlist iniciada no painel!');
           break;
 
         case 'schedule':
@@ -776,25 +762,16 @@ const Playlists: React.FC = () => {
           window.location.href = `/dashboard/agendamentos?playlist=${selectedAction.playlistId}`;
           break;
 
+        case 'start':
+          // Redirecionar para página de transmissão externa
+          window.location.href = `/dashboard/iniciar-transmissao?playlist=${selectedAction.playlistId}`;
+          break;
+
         case 'pause':
         case 'stop':
-          // Parar transmissão
-          const stopResponse = await fetch('/api/streaming/stop', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`
-            },
-            body: JSON.stringify({
-              stream_type: 'playlist'
-            })
-          });
-
-          if (stopResponse.ok) {
-            toast.success('Transmissão pausada/parada!');
-          } else {
-            toast.error('Erro ao parar transmissão');
-          }
+          // Parar transmissão interna
+          await stopStream();
+          toast.success('Playlist parada!');
           break;
       }
     } catch (error) {
@@ -921,16 +898,23 @@ const Playlists: React.FC = () => {
                       <Play size={16} />
                     </button>
                     <button
-                      title="Iniciar transmissão"
-                      onClick={() => openActionModal(playlist, 'start')}
+                      title="Iniciar no painel"
+                      onClick={() => openActionModal(playlist, 'start_internal')}
                       className="text-blue-600 hover:text-blue-800 transition p-1"
                     >
                       <Play size={16} className="fill-current" />
                     </button>
                     <button
+                      title="Transmitir para plataformas"
+                      onClick={() => openActionModal(playlist, 'start')}
+                      className="text-purple-600 hover:text-purple-800 transition p-1"
+                    >
+                      <Radio size={16} />
+                    </button>
+                    <button
                       title="Agendar playlist"
                       onClick={() => openActionModal(playlist, 'schedule')}
-                      className="text-purple-600 hover:text-purple-800 transition p-1"
+                      className="text-orange-600 hover:text-orange-800 transition p-1"
                     >
                       <Calendar size={16} />
                     </button>
@@ -1257,17 +1241,27 @@ const Playlists: React.FC = () => {
             </h3>
             
             <p className="text-gray-700 mb-4">
-              {selectedAction.type === 'start' && `Deseja iniciar a transmissão da playlist "${selectedAction.playlistName}"?`}
+              {selectedAction.type === 'start_internal' && `Deseja iniciar a playlist "${selectedAction.playlistName}" no painel?`}
+              {selectedAction.type === 'start' && `Deseja transmitir a playlist "${selectedAction.playlistName}" para plataformas externas?`}
               {selectedAction.type === 'schedule' && `Você será redirecionado para a página de agendamentos para configurar quando a playlist "${selectedAction.playlistName}" deve ser executada.`}
               {selectedAction.type === 'pause' && `Deseja pausar a transmissão atual?`}
               {selectedAction.type === 'stop' && `Deseja parar a transmissão atual?`}
             </p>
 
+            {selectedAction.type === 'start_internal' && (
+              <div className="bg-blue-50 border border-blue-200 rounded-md p-3 mb-4">
+                <p className="text-sm text-blue-800">
+                  <strong>Nota:</strong> A playlist será reproduzida no player do painel. 
+                  Use a página "Players" para gerar links externos para compartilhamento.
+                </p>
+              </div>
+            )}
+
             {selectedAction.type === 'start' && (
               <div className="bg-blue-50 border border-blue-200 rounded-md p-3 mb-4">
                 <p className="text-sm text-blue-800">
-                  <strong>Nota:</strong> A transmissão será iniciada sem plataformas configuradas. 
-                  Você pode configurar plataformas na página "Iniciar Transmissão".
+                  <strong>Nota:</strong> Você será redirecionado para a página de transmissão 
+                  onde poderá configurar as plataformas de destino.
                 </p>
               </div>
             )}
@@ -1282,12 +1276,14 @@ const Playlists: React.FC = () => {
               <button
                 onClick={executePlaylistAction}
                 className={`px-4 py-2 rounded-md transition-colors text-white ${
-                  selectedAction.type === 'start' ? 'bg-green-600 hover:bg-green-700' :
+                  selectedAction.type === 'start_internal' ? 'bg-blue-600 hover:bg-blue-700' :
+                  selectedAction.type === 'start' ? 'bg-purple-600 hover:bg-purple-700' :
                   selectedAction.type === 'schedule' ? 'bg-purple-600 hover:bg-purple-700' :
                   'bg-red-600 hover:bg-red-700'
                 }`}
               >
-                {selectedAction.type === 'start' && 'Iniciar Transmissão'}
+                {selectedAction.type === 'start_internal' && 'Iniciar no Painel'}
+                {selectedAction.type === 'start' && 'Transmitir Externamente'}
                 {selectedAction.type === 'schedule' && 'Ir para Agendamentos'}
                 {selectedAction.type === 'pause' && 'Pausar'}
                 {selectedAction.type === 'stop' && 'Parar'}
